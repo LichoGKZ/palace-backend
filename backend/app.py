@@ -65,9 +65,7 @@ def init_db():
 
 
 def generate_code(conn, length=4):
-    alphabet = string.ascii_uppercase + string.digits
-    # evitar caracteres confusos
-    alphabet = alphabet.replace("O", "").replace("0", "").replace("I", "").replace("1", "")
+    alphabet = string.digits
     while True:
         code = "".join(random.choice(alphabet) for _ in range(length))
         exists = conn.execute("SELECT 1 FROM sessions WHERE code = ?", (code,)).fetchone()
