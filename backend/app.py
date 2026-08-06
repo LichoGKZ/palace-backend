@@ -77,6 +77,24 @@ def sha256_hash(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
 
 
+
+@app.route("/api/debug", methods=["GET"])
+def debug():
+    conn = get_db()
+
+    tablas = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+
+    sesiones = conn.execute(
+        "SELECT * FROM sessions ORDER BY id DESC LIMIT 10"
+    ).fetchall()
+
+    return jsonify({
+        "tables": [x["name"] for x in tablas],
+        "sessions": [dict(x) for x in sesiones]
+    })
+
 # ---------- Endpoints usados por la LANDING ----------
 @app.route("/api/session", methods=["POST"])
 def create_session():
