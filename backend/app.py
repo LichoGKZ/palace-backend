@@ -196,6 +196,9 @@ def send_purchase_event(row, value, currency, order_id, email=None):
     user_data = {
         "client_ip_address": row["client_ip"],
         "client_user_agent": row["user_agent"],
+        "external_id": [
+            sha256_hash(row["discord_id"])
+        ]
     }
     if row["fbp"]:
         user_data["fbp"] = row["fbp"]
