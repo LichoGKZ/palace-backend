@@ -219,7 +219,8 @@ def send_purchase_event(row, value, currency, order_id, email=None):
                     "order_id": order_id,
                 },
             }
-        ]
+        ],
+        "test_event_code": "TEST73462"
     }
 
     url = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PIXEL_ID}/events"
