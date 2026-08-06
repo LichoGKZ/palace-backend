@@ -217,3 +217,7 @@ def send_purchase_event(row, value, currency, order_id, email=None):
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+else:
+    # Cuando corre bajo gunicorn (Render), __main__ nunca se ejecuta,
+    # así que inicializamos la DB al importar el módulo.
+    init_db()
