@@ -73,6 +73,7 @@ def init_db():
                     discord_id TEXT,
                     discord_username TEXT,
                     verified_at TEXT,
+                    lead_sent_at TEXT,
                     purchased_at TEXT
                 )
                 """
@@ -132,34 +133,106 @@ def check_secret(req):
 
 @app.route("/api/verify", methods=["POST"])
 def verify_code():
+
     if not check_secret(request):
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(force=True) or {}
+
     code = (data.get("code") or "").strip().upper()
     discord_id = str(data.get("discord_id"))
     discord_username = data.get("discord_username", "")
 
+    if not code or not discord_id:
+        return jsonify({
+            "ok": False,
+            "reason": "missing_data"
+        }), 400
+
     conn = get_db()
+
     with dict_cursor(conn) as cur:
-        cur.execute("SELECT * FROM sessions WHERE code = %s", (code,))
-        row = cur.fetchone()
-
-        if row is None:
-            return jsonify({"ok": False, "reason": "code_not_found"}), 404
-
-        if row["verified_at"] is not None:
-            return jsonify({"ok": False, "reason": "code_already_used"}), 409
 
         cur.execute(
-            """UPDATE sessions SET discord_id = %s, discord_username = %s, verified_at = %s
-               WHERE code = %s""",
-            (discord_id, discord_username, datetime.now(timezone.utc).isoformat(), code),
+            "SELECT * FROM sessions WHERE code = %s",
+            (code,)
         )
+
+        row = cur.fetchone()
+
+        # Código inexistente
+        if row is None:
+            return jsonify({
+                "ok": False,
+                "reason": "code_not_found"
+            }), 404
+
+        # Código ya utilizado
+        if row["verified_at"] is not None:
+            return jsonify({
+                "ok": False,
+                "reason": "code_already_used"
+            }), 409
+
+        verified_at = datetime.now(timezone.utc).isoformat()
+
+        # Vincular sesión con Discord
+        cur.execute(
+            """
+            UPDATE sessions
+            SET
+                discord_id = %s,
+                discord_username = %s,
+                verified_at = %s
+            WHERE code = %s
+            """,
+            (
+                discord_id,
+                discord_username,
+                verified_at,
+                code
+            )
+        )
+
+        # Volvemos a obtener la sesión actualizada
+        cur.execute(
+            """
+            SELECT *
+            FROM sessions
+            WHERE code = %s
+            """,
+            (code,)
+        )
+
+        row = cur.fetchone()
+
+        # ==========================================
+        # 🔥 LEAD → META
+        # ==========================================
+
+        lead_result = send_lead_event(row)
+
+        # Guardamos que se intentó/enviò el Lead
+        lead_sent_at = datetime.now(timezone.utc).isoformat()
+
+        cur.execute(
+            """
+            UPDATE sessions
+            SET lead_sent_at = %s
+            WHERE id = %s
+            """,
+            (
+                lead_sent_at,
+                row["id"]
+            )
+        )
+
     conn.commit()
 
-    return jsonify({"ok": True})
-
+    return jsonify({
+        "ok": True,
+        "lead": lead_result
+    })
 
 @app.route("/api/purchase", methods=["POST"])
 def register_purchase():
@@ -238,6 +311,61 @@ def send_purchase_event(row, value, currency, order_id, email=None):
         return resp.json()
     except Exception:
         return {"status_code": resp.status_code, "text": resp.text}
+
+
+def send_lead_event(row):
+    if not FB_PIXEL_ID or not FB_ACCESS_TOKEN:
+        return {
+            "skipped": "FB_PIXEL_ID / FB_ACCESS_TOKEN no configurados"
+        }
+
+    user_data = {
+        "client_ip_address": row["client_ip"],
+        "client_user_agent": row["user_agent"],
+        "external_id": [
+            sha256_hash(row["discord_id"])
+        ]
+    }
+
+    if row["fbp"]:
+        user_data["fbp"] = row["fbp"]
+
+    if row["fbc"]:
+        user_data["fbc"] = row["fbc"]
+
+    event_id = f"lead_{row['session_id']}"
+
+    payload = {
+        "data": [
+            {
+                "event_name": "Lead",
+                "event_time": int(time.time()),
+                "event_id": event_id,
+                "action_source": "website",
+                "event_source_url": LANDING_URL,
+                "user_data": user_data
+            }
+        ]
+    }
+
+    url = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PIXEL_ID}/events"
+
+    resp = requests.post(
+        url,
+        params={
+            "access_token": FB_ACCESS_TOKEN
+        },
+        json=payload,
+        timeout=10
+    )
+
+    try:
+        return resp.json()
+    except Exception:
+        return {
+            "status_code": resp.status_code,
+            "text": resp.text
+        }
 
 
 if __name__ == "__main__":
