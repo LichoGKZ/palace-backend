@@ -1,17 +1,24 @@
 import os
-import sqlite3
 import uuid
 import random
 import string
 import hashlib
 import time
 import requests
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import SimpleConnectionPool
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
 # ---------- Configuración ----------
-DB_PATH = os.environ.get("DB_PATH", "tracking.db")
+# Connection string de Supabase (Settings -> Database -> Connection string -> modo "Transaction" con pooler)
+# Ejemplo: postgresql://postgres.xxxx:PASSWORD@aws-0-region.pooler.supabase.com:6543/postgres
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("Falta la env var DATABASE_URL con la connection string de Supabase")
+
 BOT_SECRET = os.environ.get("BOT_SECRET", "cambiame")  # secreto compartido con el bot
 FB_PIXEL_ID = os.environ.get("FB_PIXEL_ID", "")
 FB_ACCESS_TOKEN = os.environ.get("FB_ACCESS_TOKEN", "")
@@ -23,12 +30,14 @@ ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
 
+# ---------- Pool de conexiones ----------
+# minconn/maxconn moderados: Render + gunicorn con pocos workers no necesita mucho más
+pool = SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
 
-# ---------- DB ----------
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = pool.getconn()
     return g.db
 
 
@@ -36,64 +45,75 @@ def get_db():
 def close_db(exception=None):
     db = g.pop("db", None)
     if db is not None:
-        db.close()
+        if exception is not None:
+            db.rollback()
+        pool.putconn(db)
+
+
+def dict_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT UNIQUE NOT NULL,
-            code TEXT UNIQUE NOT NULL,
-            fbp TEXT,
-            fbc TEXT,
-            fbclid TEXT,
-            client_ip TEXT,
-            user_agent TEXT,
-            created_at TEXT NOT NULL,
-            discord_id TEXT,
-            discord_username TEXT,
-            verified_at TEXT,
-            purchased_at TEXT
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id SERIAL PRIMARY KEY,
+                    session_id TEXT UNIQUE NOT NULL,
+                    code TEXT UNIQUE NOT NULL,
+                    fbp TEXT,
+                    fbc TEXT,
+                    fbclid TEXT,
+                    client_ip TEXT,
+                    user_agent TEXT,
+                    created_at TEXT NOT NULL,
+                    discord_id TEXT,
+                    discord_username TEXT,
+                    verified_at TEXT,
+                    purchased_at TEXT
+                )
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def generate_code(conn, length=4):
     alphabet = string.digits
-    while True:
-        code = "".join(random.choice(alphabet) for _ in range(length))
-        exists = conn.execute("SELECT 1 FROM sessions WHERE code = ?", (code,)).fetchone()
-        if not exists:
-            return code
+    with dict_cursor(conn) as cur:
+        while True:
+            code = "".join(random.choice(alphabet) for _ in range(length))
+            cur.execute("SELECT 1 FROM sessions WHERE code = %s", (code,))
+            exists = cur.fetchone()
+            if not exists:
+                return code
 
 
 def sha256_hash(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
 
 
-
 @app.route("/api/debug", methods=["GET"])
 def debug():
     conn = get_db()
+    with dict_cursor(conn) as cur:
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+        )
+        tablas = cur.fetchall()
 
-    tablas = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()
-
-    sesiones = conn.execute(
-        "SELECT * FROM sessions ORDER BY id DESC LIMIT 10"
-    ).fetchall()
+        cur.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT 10")
+        sesiones = cur.fetchall()
 
     return jsonify({
-        "tables": [x["name"] for x in tablas],
-        "sessions": [dict(x) for x in sesiones]
+        "tables": [x["table_name"] for x in tablas],
+        "sessions": [dict(x) for x in sesiones],
     })
+
 
 # ---------- Endpoints usados por la LANDING ----------
 @app.route("/api/session", methods=["POST"])
@@ -111,12 +131,13 @@ def create_session():
     code = generate_code(conn)
     created_at = datetime.now(timezone.utc).isoformat()
 
-    conn.execute(
-        """INSERT INTO sessions
-           (session_id, code, fbp, fbc, fbclid, client_ip, user_agent, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, code, fbp, fbc, fbclid, client_ip, user_agent, created_at),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO sessions
+               (session_id, code, fbp, fbc, fbclid, client_ip, user_agent, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (session_id, code, fbp, fbc, fbclid, client_ip, user_agent, created_at),
+        )
     conn.commit()
 
     return jsonify({"session_id": session_id, "code": code})
@@ -138,19 +159,21 @@ def verify_code():
     discord_username = data.get("discord_username", "")
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM sessions WHERE code = ?", (code,)).fetchone()
+    with dict_cursor(conn) as cur:
+        cur.execute("SELECT * FROM sessions WHERE code = %s", (code,))
+        row = cur.fetchone()
 
-    if row is None:
-        return jsonify({"ok": False, "reason": "code_not_found"}), 404
+        if row is None:
+            return jsonify({"ok": False, "reason": "code_not_found"}), 404
 
-    if row["verified_at"] is not None:
-        return jsonify({"ok": False, "reason": "code_already_used"}), 409
+        if row["verified_at"] is not None:
+            return jsonify({"ok": False, "reason": "code_already_used"}), 409
 
-    conn.execute(
-        """UPDATE sessions SET discord_id = ?, discord_username = ?, verified_at = ?
-           WHERE code = ?""",
-        (discord_id, discord_username, datetime.now(timezone.utc).isoformat(), code),
-    )
+        cur.execute(
+            """UPDATE sessions SET discord_id = %s, discord_username = %s, verified_at = %s
+               WHERE code = %s""",
+            (discord_id, discord_username, datetime.now(timezone.utc).isoformat(), code),
+        )
     conn.commit()
 
     return jsonify({"ok": True})
@@ -169,21 +192,23 @@ def register_purchase():
     email = data.get("email")  # opcional, si lo tenés
 
     conn = get_db()
-    row = conn.execute(
-        """SELECT * FROM sessions WHERE discord_id = ? AND verified_at IS NOT NULL
-           ORDER BY verified_at DESC LIMIT 1""",
-        (discord_id,),
-    ).fetchone()
+    with dict_cursor(conn) as cur:
+        cur.execute(
+            """SELECT * FROM sessions WHERE discord_id = %s AND verified_at IS NOT NULL
+               ORDER BY verified_at DESC LIMIT 1""",
+            (discord_id,),
+        )
+        row = cur.fetchone()
 
-    if row is None:
-        return jsonify({"ok": False, "reason": "no_verified_session_for_discord_id"}), 404
+        if row is None:
+            return jsonify({"ok": False, "reason": "no_verified_session_for_discord_id"}), 404
 
-    result = send_purchase_event(row, value, currency, order_id, email)
+        result = send_purchase_event(row, value, currency, order_id, email)
 
-    conn.execute(
-        "UPDATE sessions SET purchased_at = ? WHERE id = ?",
-        (datetime.now(timezone.utc).isoformat(), row["id"]),
-    )
+        cur.execute(
+            "UPDATE sessions SET purchased_at = %s WHERE id = %s",
+            (datetime.now(timezone.utc).isoformat(), row["id"]),
+        )
     conn.commit()
 
     return jsonify({"ok": True, "meta_response": result})
