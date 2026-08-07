@@ -19,11 +19,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Falta la env var DATABASE_URL con la connection string de Supabase")
 
-BOT_SECRET = os.environ.get("BOT_SECRET", "cambiame")  # secreto compartido con el bot
+BOT_SECRET = os.environ.get("BOT_SECRET", "5bb35bd2e3317744f2630e6e53d74c3f")  # secreto compartido con el bot
 FB_PIXEL_ID = os.environ.get("FB_PIXEL_ID", "")
 FB_ACCESS_TOKEN = os.environ.get("FB_ACCESS_TOKEN", "")
 FB_API_VERSION = os.environ.get("FB_API_VERSION", "v20.0")
-LANDING_URL = os.environ.get("LANDING_URL", "https://tusitio.com/")
+LANDING_URL = os.environ.get("LANDING_URL", "palace-landing-chi.vercel.app/")
 # En prod, restringí CORS a tu dominio real de landing
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 
