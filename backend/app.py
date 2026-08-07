@@ -345,8 +345,7 @@ def send_lead_event(row):
                 "event_source_url": LANDING_URL,
                 "user_data": user_data
             }
-        ],
-        "test_event_code": "TEST96609"
+        ]
     }
 
     url = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PIXEL_ID}/events"
