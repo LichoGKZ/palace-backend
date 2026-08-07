@@ -82,6 +82,15 @@ def init_db():
     finally:
         conn.close()
 
+def cleanup_expired_sessions(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM sessions
+            WHERE verified_at IS NULL
+            AND created_at::timestamptz < NOW() - INTERVAL '12 hours'
+            """
+        )
 
 def generate_code(conn, length=4):
     alphabet = string.digits
@@ -110,6 +119,7 @@ def create_session():
     user_agent = request.headers.get("User-Agent", "")
 
     conn = get_db()
+    cleanup_expired_sessions(conn)
     session_id = str(uuid.uuid4())
     code = generate_code(conn)
     created_at = datetime.now(timezone.utc).isoformat()
