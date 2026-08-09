@@ -82,13 +82,15 @@ def init_db():
                     discord_username TEXT,
                     verified_at TEXT,
                     lead_sent_at TEXT,
-                    purchased_at TEXT
+                    purchased_at TEXT,
+                    checkout_clicked_at TEXT
                 )
                 """
             )
             # Migración segura para bases ya existentes que no tenían estas columnas
             cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ttclid TEXT")
             cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ttp TEXT")
+            cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS checkout_clicked_at TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -182,6 +184,45 @@ def create_session():
     conn.commit()
 
     return jsonify({"session_id": session_id, "code": code})
+
+
+@app.route("/api/checkout-click", methods=["POST"])
+def checkout_click():
+    """
+    Llamado por la landing en el momento del click en 'Ir al Discord'.
+    Envía InitiateCheckout server-side, como redundancia del evento client-side
+    del pixel (por si el navegador bloquea el pixel, Safari/iOS ITP, etc).
+    No requiere BOT_SECRET porque lo llama la landing directamente, no el bot.
+    """
+    data = request.get_json(force=True) or {}
+    session_id = data.get("session_id")
+
+    if not session_id:
+        return jsonify({"ok": False, "reason": "missing_session_id"}), 400
+
+    conn = get_db()
+    with dict_cursor(conn) as cur:
+        cur.execute("SELECT * FROM sessions WHERE session_id = %s", (session_id,))
+        row = cur.fetchone()
+
+        if row is None:
+            return jsonify({"ok": False, "reason": "session_not_found"}), 404
+
+        event_id = f"checkout_{row['session_id']}"
+        tiktok_result = send_tiktok_event(
+            "InitiateCheckout",
+            row,
+            event_id=event_id,
+            content_name="Palace VIP Oro",
+        )
+
+        cur.execute(
+            "UPDATE sessions SET checkout_clicked_at = %s WHERE id = %s",
+            (datetime.now(timezone.utc).isoformat(), row["id"]),
+        )
+    conn.commit()
+
+    return jsonify({"ok": True, "tiktok_response": tiktok_result})
 
 
 # ---------- Endpoints usados por el BOT ----------
@@ -452,8 +493,13 @@ def send_tiktok_event(event_name, row, value=None, currency="ARS", event_id=None
     if not TIKTOK_PIXEL_ID or not TIKTOK_ACCESS_TOKEN:
         return {"skipped": "TIKTOK_PIXEL_ID / TIKTOK_ACCESS_TOKEN no configurados"}
 
+    # A veces este evento se dispara antes de que exista discord_id
+    # (ej. InitiateCheckout, que ocurre antes de la verificación en Discord).
+    # En ese caso usamos el session_id como identificador de matching.
+    external_id_source = row.get("discord_id") or row.get("session_id")
+
     user = {
-        "external_id": [sha256_hash(row["discord_id"])],
+        "external_id": [sha256_hash(external_id_source)],
         "ip": row.get("client_ip"),
         "user_agent": row.get("user_agent"),
     }
