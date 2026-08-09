@@ -373,7 +373,7 @@ def register_purchase():
 
         result = send_purchase_event(row, value, currency, order_id, email)
         tiktok_result = send_tiktok_event(
-            "PlaceAnOrder",
+            "Purchase",
             row,
             value=value,
             currency=currency,
