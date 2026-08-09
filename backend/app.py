@@ -103,6 +103,39 @@ def generate_code(conn, length=4):
                 return code
 
 
+def build_fbc(fbclid: str, created_at_iso: str = None) -> str:
+    """
+    Construye el parámetro fbc en el formato oficial que espera Meta:
+    fb.<subdomain_index>.<creation_time_ms>.<fbclid>
+    Nunca modifica el fbclid (ni .lower(), ni slicing): se usa tal cual llegó.
+    Docs: https://developers.facebook.com/docs/marketing-api/conversions-api/parameters/fbp-and-fbc
+    """
+    if not fbclid:
+        return None
+    if created_at_iso:
+        try:
+            ts_ms = int(datetime.fromisoformat(created_at_iso).timestamp() * 1000)
+        except Exception:
+            ts_ms = int(time.time() * 1000)
+    else:
+        ts_ms = int(time.time() * 1000)
+    return f"fb.1.{ts_ms}.{fbclid}"
+
+
+def resolve_fbc(row) -> str:
+    """
+    Devuelve el fbc a enviar a Meta, priorizando el fbc real capturado por el
+    pixel (cookie _fbc) si tiene formato válido "fb.<n>.<ts>.<fbclid>".
+    Si no es válido o falta, lo reconstruye a partir del fbclid crudo guardado
+    en la sesión, sin aplicarle ningún tipo de normalización (lower/strip/slice)
+    que pueda alterar el fbclid original.
+    """
+    fbc = row.get("fbc")
+    if fbc and fbc.count(".") >= 3 and fbc.startswith("fb."):
+        return fbc
+    return build_fbc(row.get("fbclid"), row.get("created_at"))
+
+
 def sha256_hash(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
 
@@ -292,8 +325,9 @@ def send_purchase_event(row, value, currency, order_id, email=None):
     }
     if row["fbp"]:
         user_data["fbp"] = row["fbp"]
-    if row["fbc"]:
-        user_data["fbc"] = row["fbc"]
+    fbc = resolve_fbc(row)
+    if fbc:
+        user_data["fbc"] = fbc
     if email:
         user_data["em"] = [sha256_hash(email)]
 
@@ -340,8 +374,9 @@ def send_lead_event(row):
     if row["fbp"]:
         user_data["fbp"] = row["fbp"]
 
-    if row["fbc"]:
-        user_data["fbc"] = row["fbc"]
+    fbc = resolve_fbc(row)
+    if fbc:
+        user_data["fbc"] = fbc
 
     event_id = f"lead_{row['session_id']}"
 
