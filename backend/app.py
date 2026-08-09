@@ -214,6 +214,7 @@ def checkout_click():
             row,
             event_id=event_id,
             content_name="Palace VIP Oro",
+            content_id="vip-oro",
         )
 
         cur.execute(
@@ -315,7 +316,12 @@ def verify_code():
         # 🔥 LEAD → TIKTOK
         # ==========================================
 
-        tiktok_lead_result = send_tiktok_event("CompleteRegistration", row)
+        tiktok_lead_result = send_tiktok_event(
+            "CompleteRegistration",
+            row,
+            content_name="Palace VIP Oro",
+            content_id="vip-oro",
+        )
 
         # Guardamos que se intentó/enviò el Lead
         lead_sent_at = datetime.now(timezone.utc).isoformat()
@@ -372,6 +378,8 @@ def register_purchase():
             value=value,
             currency=currency,
             event_id=order_id,
+            content_name="Palace VIP Oro",
+            content_id="vip-oro",
             email=email,
         )
 
@@ -489,7 +497,7 @@ def send_lead_event(row):
         }
 
 
-def send_tiktok_event(event_name, row, value=None, currency="ARS", event_id=None, content_name=None, email=None):
+def send_tiktok_event(event_name, row, value=None, currency="ARS", event_id=None, content_name=None, content_id=None, email=None):
     if not TIKTOK_PIXEL_ID or not TIKTOK_ACCESS_TOKEN:
         return {"skipped": "TIKTOK_PIXEL_ID / TIKTOK_ACCESS_TOKEN no configurados"}
 
@@ -515,6 +523,15 @@ def send_tiktok_event(event_name, row, value=None, currency="ARS", event_id=None
         properties["value"] = value
     if content_name:
         properties["content_name"] = content_name
+    if content_id:
+        properties["content_id"] = content_id
+        properties["contents"] = [
+            {
+                "content_id": content_id,
+                "content_name": content_name,
+                "content_type": "product",
+            }
+        ]
 
     payload = {
         "event_source": "web",
