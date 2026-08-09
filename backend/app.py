@@ -20,9 +20,15 @@ if not DATABASE_URL:
     raise RuntimeError("Falta la env var DATABASE_URL con la connection string de Supabase")
 
 BOT_SECRET = os.environ.get("BOT_SECRET", "5bb35bd2e3317744f2630e6e53d74c3f")  # secreto compartido con el bot
+
 FB_PIXEL_ID = os.environ.get("FB_PIXEL_ID", "")
 FB_ACCESS_TOKEN = os.environ.get("FB_ACCESS_TOKEN", "")
 FB_API_VERSION = os.environ.get("FB_API_VERSION", "v20.0")
+
+TIKTOK_PIXEL_ID = os.environ.get("TIKTOK_PIXEL_ID", "")
+TIKTOK_ACCESS_TOKEN = os.environ.get("TIKTOK_ACCESS_TOKEN", "")
+TIKTOK_API_VERSION = "v1.3"  # fija, no hace falta configurarla desde afuera
+
 LANDING_URL = os.environ.get("LANDING_URL", "palace-landing-chi.vercel.app/")
 # En prod, restringí CORS a tu dominio real de landing
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
@@ -67,6 +73,8 @@ def init_db():
                     fbp TEXT,
                     fbc TEXT,
                     fbclid TEXT,
+                    ttclid TEXT,
+                    ttp TEXT,
                     client_ip TEXT,
                     user_agent TEXT,
                     created_at TEXT NOT NULL,
@@ -78,9 +86,13 @@ def init_db():
                 )
                 """
             )
+            # Migración segura para bases ya existentes que no tenían estas columnas
+            cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ttclid TEXT")
+            cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ttp TEXT")
         conn.commit()
     finally:
         conn.close()
+
 
 def cleanup_expired_sessions(conn):
     with conn.cursor() as cur:
@@ -91,6 +103,7 @@ def cleanup_expired_sessions(conn):
             AND created_at::timestamptz < NOW() - INTERVAL '12 hours'
             """
         )
+
 
 def generate_code(conn, length=4):
     alphabet = string.digits
@@ -147,6 +160,8 @@ def create_session():
     fbp = data.get("fbp")
     fbc = data.get("fbc")
     fbclid = data.get("fbclid")
+    ttclid = data.get("ttclid")
+    ttp = data.get("ttp")
 
     client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     user_agent = request.headers.get("User-Agent", "")
@@ -160,9 +175,9 @@ def create_session():
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO sessions
-               (session_id, code, fbp, fbc, fbclid, client_ip, user_agent, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-            (session_id, code, fbp, fbc, fbclid, client_ip, user_agent, created_at),
+               (session_id, code, fbp, fbc, fbclid, ttclid, ttp, client_ip, user_agent, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (session_id, code, fbp, fbc, fbclid, ttclid, ttp, client_ip, user_agent, created_at),
         )
     conn.commit()
 
@@ -255,6 +270,12 @@ def verify_code():
 
         lead_result = send_lead_event(row)
 
+        # ==========================================
+        # 🔥 LEAD → TIKTOK
+        # ==========================================
+
+        tiktok_lead_result = send_tiktok_event("CompleteRegistration", row)
+
         # Guardamos que se intentó/enviò el Lead
         lead_sent_at = datetime.now(timezone.utc).isoformat()
 
@@ -274,8 +295,10 @@ def verify_code():
 
     return jsonify({
         "ok": True,
-        "lead": lead_result
+        "lead": lead_result,
+        "tiktok_lead": tiktok_lead_result
     })
+
 
 @app.route("/api/purchase", methods=["POST"])
 def register_purchase():
@@ -302,6 +325,14 @@ def register_purchase():
             return jsonify({"ok": False, "reason": "no_verified_session_for_discord_id"}), 404
 
         result = send_purchase_event(row, value, currency, order_id, email)
+        tiktok_result = send_tiktok_event(
+            "PlaceAnOrder",
+            row,
+            value=value,
+            currency=currency,
+            event_id=order_id,
+            email=email,
+        )
 
         cur.execute(
             "UPDATE sessions SET purchased_at = %s WHERE id = %s",
@@ -309,7 +340,11 @@ def register_purchase():
         )
     conn.commit()
 
-    return jsonify({"ok": True, "meta_response": result})
+    return jsonify({
+        "ok": True,
+        "meta_response": result,
+        "tiktok_response": tiktok_result
+    })
 
 
 def send_purchase_event(row, value, currency, order_id, email=None):
@@ -411,6 +446,56 @@ def send_lead_event(row):
             "status_code": resp.status_code,
             "text": resp.text
         }
+
+
+def send_tiktok_event(event_name, row, value=None, currency="ARS", event_id=None, content_name=None, email=None):
+    if not TIKTOK_PIXEL_ID or not TIKTOK_ACCESS_TOKEN:
+        return {"skipped": "TIKTOK_PIXEL_ID / TIKTOK_ACCESS_TOKEN no configurados"}
+
+    user = {
+        "external_id": [sha256_hash(row["discord_id"])],
+        "ip": row.get("client_ip"),
+        "user_agent": row.get("user_agent"),
+    }
+    if row.get("ttclid"):
+        user["ttclid"] = row["ttclid"]
+    if row.get("ttp"):
+        user["ttp"] = row["ttp"]
+    if email:
+        user["email"] = [sha256_hash(email)]
+
+    properties = {"currency": currency}
+    if value is not None:
+        properties["value"] = value
+    if content_name:
+        properties["content_name"] = content_name
+
+    payload = {
+        "event_source": "web",
+        "event_source_id": TIKTOK_PIXEL_ID,
+        "data": [
+            {
+                "event": event_name,
+                "event_time": int(time.time()),
+                "event_id": event_id or f"{event_name.lower()}_{row['session_id']}",
+                "user": user,
+                "properties": properties,
+                "page": {"url": LANDING_URL},
+            }
+        ],
+    }
+
+    url = f"https://business-api.tiktok.com/open_api/{TIKTOK_API_VERSION}/event/track/"
+    headers = {"Access-Token": TIKTOK_ACCESS_TOKEN, "Content-Type": "application/json"}
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        try:
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code, "text": resp.text}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 if __name__ == "__main__":
